@@ -5,7 +5,7 @@ Flask backend for Job Ad Credibility Checker
 - Image OCR support via pytesseract
 - Returns response matching frontend PredictionResult shape
 """
-
+from rule_explainer import generate_explanation
 import pandas as pd
 import numpy as np
 import joblib
@@ -24,6 +24,8 @@ from flask_cors import CORS
 import warnings
 warnings.filterwarnings('ignore')
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,9 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- Global Variables --- #
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, 'mbert')
+
 tokenizer = None
 bert_model = None
 log_reg_model = None
@@ -51,10 +56,11 @@ def load_resources():
 
     start = time.time()
     logger.info("Loading mBERT tokenizer and model...")
-    # bert-base-multilingual-cased
+    if not os.path.exists(MODEL_DIR):
+        raise FileNotFoundError(f"Local mBERT model folder not found at {MODEL_DIR}")
 
-    tokenizer = AutoTokenizer.from_pretrained('mbert')
-    bert_model = AutoModel.from_pretrained('mbert')
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
+    bert_model = AutoModel.from_pretrained(MODEL_DIR, local_files_only=True)
     bert_model.eval()
     bert_model.to(DEVICE)
 
@@ -63,6 +69,7 @@ def load_resources():
     model_path = 'logistic_regression_model.pkl'
     if os.path.exists(model_path):
         log_reg_model = joblib.load(model_path)
+        print("Model classes:", log_reg_model.classes_)
         logger.info(f"Logistic Regression loaded from {model_path}")
     else:
         raise FileNotFoundError(f"Model file not found at {model_path}")
@@ -149,6 +156,7 @@ def get_bert_embeddings(text_list, max_length=128, batch_size=32):
     return np.array(embeddings)
 
 
+
 def get_numerical_features_for_single_input(raw_salary_str):
     temp_df = pd.DataFrame({'salary_tzs': [raw_salary_str], 'salary_original': [raw_salary_str]})
     temp_df['salary_numeric'] = temp_df['salary_tzs'].apply(clean_salary)
@@ -166,43 +174,107 @@ def get_numerical_features_for_single_input(raw_salary_str):
     return salary_numeric_scaled, has_numeric_salary, temp_df['salary_status'].values[0]
 
 
+def build_fast_explanation(text, predicted_class):
+    text_lower = (text or '').lower()
+    explanation = []
+
+    fake_indicators = [
+        (['fee', 'payment', 'pay', 'deposit', 'registration', 'malipo', 'lipa', 'ada', 'tuma fedha'], 'payment', 'payment'),
+        (['whatsapp', 'gmail', 'yahoo', 'hotmail', 'simu', 'whatsapp'], 'contact', 'contact'),
+        (['deadline', 'closing date', 'apply before', 'tarehe ya mwisho', 'mwisho wa kutuma'], 'deadline', 'deadline'),
+        (['degree', 'diploma', 'bachelor', 'experience', 'skills', 'shahada', 'sifa', 'uzoefu'], 'qualification', 'qualification'),
+        (['responsibilities', 'duties', 'role', 'tasks', 'majukumu', 'wajibu', 'kazi'], 'responsibility', 'responsibility'),
+    ]
+
+    if 'fake' in predicted_class.lower() or 'feki' in predicted_class.lower():
+        for keywords, key, _ in fake_indicators:
+            hits = [kw for kw in keywords if kw in text_lower]
+            if hits:
+                explanation.append({
+                    'word': hits[0],
+                    'weight': '0.25'
+                })
+        if not explanation:
+            explanation.append({'word': 'No strong fraud indicators found', 'weight': '0.00'})
+    else:
+        if any(k in text_lower for k in ['company', 'organization', 'kampuni', 'mwajiri', 'inc', 'ltd']):
+            explanation.append({'word': 'Company details provided', 'weight': '-0.20'})
+        if any(k in text_lower for k in ['responsibilities', 'duties', 'majukumu', 'wajibu']):
+            explanation.append({'word': 'Responsibilities explained', 'weight': '-0.15'})
+        if any(k in text_lower for k in ['degree', 'diploma', 'experience', 'skills', 'shahada', 'sifa', 'uzoefu']):
+            explanation.append({'word': 'Qualifications mentioned', 'weight': '-0.10'})
+        if not explanation:
+            explanation.append({'word': 'General job details found', 'weight': '-0.05'})
+
+    return explanation
+
+
+def resolve_predicted_class(prediction_proba, class_names):
+    predicted_idx = int(np.argmax(prediction_proba))
+    model_classes = getattr(log_reg_model, 'classes_', None)
+
+    if model_classes is not None and len(model_classes) > 0:
+        model_label = model_classes[predicted_idx]
+
+        if isinstance(model_label, (int, np.integer)):
+            return class_names[1] if int(model_label) == 1 else class_names[0]
+
+        predicted_label = str(model_label).strip().lower()
+        if any(token in predicted_label for token in ['fake', 'feki', 'fraud', 'scam', 'spam', '1']):
+            return class_names[1] if len(class_names) > 1 else class_names[0]
+        if any(token in predicted_label for token in ['real', 'legit', 'legitimate', 'halisi', 'genuine', 'valid', '0']):
+            return class_names[0]
+
+    return class_names[predicted_idx] if predicted_idx < len(class_names) else class_names[0]
+
+
+def looks_like_job_posting(text):
+    if not isinstance(text, str):
+        return False
+
+    cleaned = preprocess_text_for_bert(text)
+    if not cleaned:
+        return False
+
+    job_keywords = [
+        'job', 'jobs', 'hiring', 'vacancy', 'vacancies', 'position', 'positions', 'role', 'roles',
+        'apply', 'applicant', 'candidate', 'recruitment', 'recruit', 'company', 'employer', 'salary',
+        'mshahara', 'tzs', 'qualification', 'experience', 'responsibilities', 'duties', 'deadline',
+        'interview', 'cv', 'resume', 'office', 'manager', 'assistant', 'teacher', 'driver', 'nurse',
+        'engineer', 'developer', 'accountant', 'cashier', 'receptionist', 'sales', 'marketing',
+        'customer care', 'data', 'analyst', 'warehouse', 'security', 'health', 'care', 'laborer',
+        'work', 'needed', 'required', 'urgent', 'opportunity', 'employment', 'employee'
+    ]
+
+    score = 0
+    for keyword in job_keywords:
+        if keyword in cleaned:
+            score += 1
+
+    if len(cleaned.split()) >= 6:
+        score += 1
+
+    return score >= 1
+
+
 def explain_job_posting(raw_text_input, raw_salary_str, output_lang='en', class_names=None):
     if class_names is None:
         class_names = ['Real Job', 'Fake Job']
 
-    min_text_length = 50
-    if not isinstance(raw_text_input, str) or len(raw_text_input.strip()) < min_text_length:
+    if not isinstance(raw_text_input, str) or not raw_text_input.strip():
         not_job = 'Siyo Tangazo la Kazi' if output_lang == 'sw' else 'Not a Job Posting'
-        msg = ('Maandishi ni mafupi sana kiasi cha kutoonekana kama tangazo la kazi.'
-               if output_lang == 'sw' else
-               'Text too short to appear as a job posting.')
+        msg = ('Maandishi hayapo.' if output_lang == 'sw' else 'No text provided.')
         return not_job, 0.0, msg, 0.0, 0, 'N/A'
 
-    text_lower = raw_text_input.lower()
-    job_keywords = [
-        "job title", "cheo cha kazi", "job description", "maelezo ya kazi",
-        "job requirement", "mahitaji ya kazi", "employment type", "aina ya ajira",
-        "company profile", "wasifu wa kampuni", "location", "eneo",
-        "salary", "mshahara", "developer", "engineer", "manager", "sales",
-        "marketing", "nafasi ya kazi", "muajiri", "utaratibu", "mkataba"
-    ]
-    keyword_count = sum(1 for kw in job_keywords if kw in text_lower)
-    if keyword_count < 2:
+    if not looks_like_job_posting(raw_text_input):
         not_job = 'Siyo Tangazo la Kazi' if output_lang == 'sw' else 'Not a Job Posting'
-        msg = ('Maandishi hayana maneno muhimu ya kutosha kuonyesha ni tangazo la kazi.'
+        msg = ('Maandishi haya hayahusiani na tangazo la kazi. Tafadhali weka tangazo la kazi au maelezo yanayohusiana na kazi.'
                if output_lang == 'sw' else
-               'Text lacks enough job-related keywords to be a job posting.')
+               'This text does not appear to be a job advertisement. Please provide a job posting or related job information.')
         return not_job, 0.0, msg, 0.0, 0, 'N/A'
 
     salary_numeric_scaled, has_numeric_salary, salary_status_val = \
         get_numerical_features_for_single_input(raw_salary_str)
-
-    def lime_predictor(texts_list):
-        cleaned = [preprocess_text_for_bert(t) for t in texts_list]
-        text_emb = get_bert_embeddings(cleaned)
-        num_feats = np.array([[salary_numeric_scaled, has_numeric_salary]] * text_emb.shape[0])
-        combined = np.hstack((text_emb, num_feats))
-        return log_reg_model.predict_proba(combined)
 
     cleaned_original = preprocess_text_for_bert(raw_text_input)
     original_emb = get_bert_embeddings([cleaned_original], batch_size=1)[0]
@@ -211,18 +283,11 @@ def explain_job_posting(raw_text_input, raw_salary_str, output_lang='en', class_
     )).reshape(1, -1)
 
     prediction_proba = log_reg_model.predict_proba(original_combined)
-    predicted_idx = np.argmax(prediction_proba)
-    predicted_class = class_names[predicted_idx]
+    predicted_class = resolve_predicted_class(prediction_proba, class_names)
+    predicted_idx = int(np.argmax(prediction_proba))
     confidence = prediction_proba[0][predicted_idx]
 
-    explainer = lime.lime_text.LimeTextExplainer(
-        class_names=class_names, split_expression=r'\\W+', random_state=42
-    )
-    explanation = explainer.explain_instance(
-        cleaned_original, lime_predictor,
-        num_features=10, num_samples=500, labels=[predicted_idx]
-    )
-
+    explanation = build_fast_explanation(cleaned_original, predicted_class)
     return predicted_class, confidence, explanation, salary_numeric_scaled, has_numeric_salary, salary_status_val
 
 
@@ -232,16 +297,22 @@ def extract_text_from_image(image_bytes):
     try:
         from PIL import Image
         import pytesseract
-        img = Image.open(io.BytesIO(image_bytes))
-        text = pytesseract.image_to_string(img, lang='eng+swa')
-        return text.strip()
-    except ImportError:
-        logger.warning("pytesseract or PIL not installed. Cannot OCR images.")
-        return ""
-    except Exception as e:
-        logger.error(f"OCR failed: {e}")
-        return ""
+        import io
 
+        pytesseract.pytesseract.tesseract_cmd = r"D:\Program Files\tesseract.exe"
+
+        print("Executable:", pytesseract.pytesseract.tesseract_cmd)
+        print("Version:", pytesseract.get_tesseract_version())
+
+        img = Image.open(io.BytesIO(image_bytes))
+        text = pytesseract.image_to_string(img, lang="eng+swa")
+        return text.strip()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        logger.exception("OCR failed")
+        return ""
 
 # --- Health Check --- #
 
@@ -266,26 +337,38 @@ def predict():
         job_text = data.get('job_text', '')
         salary_str = data.get('salary_str', '')
         output_lang = data.get('output_lang', 'en')
+        optional_info = data.get('optional_info', '')
     else:
         job_text = request.form.get('job_text', '')
         salary_str = request.form.get('salary_str', '')
         output_lang = request.form.get('output_lang', 'en')
+        optional_info = request.form.get('optional_info', '')
 
-        # Handle image upload
-        if 'image' in request.files:
-            image_file = request.files['image']
-            if image_file.filename:
-                image_bytes = image_file.read()
-                ocr_text = extract_text_from_image(image_bytes)
-                if ocr_text:
-                    job_text = ocr_text
-                    logger.info(f"OCR extracted {len(ocr_text)} chars from image")
-                else:
-                    return jsonify({
-                        "success": False,
-                        "error": "Could not extract text from image",
-                        "message": "Could not read text from the uploaded image. Please paste the text manually."
-                    }), 400
+    if 'image' in request.files:
+        image_file = request.files['image']
+        if image_file.filename:
+            image_bytes = image_file.read()
+            ocr_text = extract_text_from_image(image_bytes)
+            text_parts = []
+            if ocr_text and ocr_text.strip():
+                text_parts.append(ocr_text.strip())
+                logger.info(f"OCR extracted {len(ocr_text)} chars from image")
+            if optional_info and optional_info.strip():
+                text_parts.append(optional_info.strip())
+
+            if text_parts:
+                job_text = '\n\n'.join(text_parts)
+            else:
+                return jsonify({
+                    "success": False,
+                    "error": "Could not extract text from image",
+                    "message": "Could not read text from the uploaded image or optional information. Please paste the text manually."
+                }), 400
+    elif optional_info and optional_info.strip():
+        if job_text and job_text.strip():
+            job_text = f"{job_text.strip()}\n\n{optional_info.strip()}"
+        else:
+            job_text = optional_info.strip()
 
     if not job_text or not job_text.strip():
         return jsonify({
@@ -308,30 +391,47 @@ def predict():
         predicted_class, confidence, explanation, _, _, _ = explain_job_posting(
             job_text, salary_str, output_lang=output_lang, class_names=class_names
         )
+        is_not_job = isinstance(predicted_class, str) and (
+            predicted_class.lower().startswith('not a job') or
+            predicted_class.lower().startswith('siyo') or
+            'not a job' in predicted_class.lower()
+        )
+        rule_reasons = [] if is_not_job else generate_explanation(job_text, predicted_class, output_lang)
 
-explanation_list = []
+        explanation_list = []
 
-if explanation and not isinstance(explanation, str):
-
-    print("Type:", type(explanation))
-    print("Available labels:", explanation.available_labels())
-    print("Predicted class:", predicted_class)
-
-    # Chukua label iliyotabiriwa na LIME
-    label = explanation.available_labels()[0]
-
-    for word, weight in explanation.as_list(label=label):
-        explanation_list.append({
-            "word": word,
-            "weight": f"{weight:.4f}"
-        })
-        
-elif isinstance(explanation, str):
-
-    explanation_list.append({
-        "word": explanation,
-        "weight": "N/A"
-    })
+        if explanation and not isinstance(explanation, str):
+            if hasattr(explanation, 'available_labels'):
+                available_labels = explanation.available_labels()
+                if len(available_labels) > 0:
+                    label = available_labels[0]
+                    for word, weight in explanation.as_list(label=label):
+                        explanation_list.append({
+                            "word": word,
+                            "weight": f"{weight:.4f}"
+                        })
+                else:
+                    explanation_list.append({
+                        "word": "No explanation available",
+                        "weight": "N/A"
+                    })
+            elif isinstance(explanation, list):
+                for item in explanation:
+                    if isinstance(item, dict):
+                        explanation_list.append({
+                            "word": item.get('word', ''),
+                            "weight": item.get('weight', 'N/A')
+                        })
+            else:
+                explanation_list.append({
+                    "word": str(explanation),
+                    "weight": "N/A"
+                })
+        elif isinstance(explanation, str):
+            explanation_list.append({
+                "word": explanation,
+                "weight": "N/A"
+            })
 
         elapsed = time.time() - start_time
         logger.info(f"Prediction completed in {elapsed:.2f}s - {predicted_class} ({confidence:.4f})")
@@ -340,11 +440,11 @@ elif isinstance(explanation, str):
             "predicted_class": predicted_class,
             "confidence": f"{confidence:.4f}",
             "explanation": explanation_list,
+            "rule_explanation": rule_reasons,  # HUMAN READABLE AI
             "raw_text": job_text,
             "processing_time_s": round(elapsed, 2),
             "success": True
         })
-
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -356,6 +456,7 @@ elif isinstance(explanation, str):
         }), 500
 
 
+load_resources()
+
 if __name__ == '__main__':
-    load_resources()
     app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
